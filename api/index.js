@@ -20,10 +20,8 @@ let botReady = false
 const botPromise = (async () => {
   if (!TOKEN) return
   bot = new Telegraf(TOKEN)
-  try {
-    await bot.telegram.getMe()
-    botReady = true
-  } catch (e) { console.error('bot init fail:', e.message) }
+  try { await bot.telegram.getMe() } catch (e) { console.warn('getMe:', e.message) }
+  botReady = true
   if (BASE && !BASE.includes('localhost')) {
     bot.telegram.setWebhook(BASE.replace(/\/+$/, '') + '/api/webhook').catch(() => {})
   }
@@ -82,25 +80,33 @@ async function uploadImageToTg(buffer, mime, chatId) {
 }
 
 async function sendFallback(chatId, html) {
-  const strip = html.replace(/<tg-spoiler[^>]*>/gi, '<span class="tg-spoiler">')
-    .replace(/<\/tg-spoiler>/gi, '</span>')
-    .replace(/<tg-slideshow>[\s\S]*?<\/tg-slideshow>/gi, '[📷 слайдшоу]')
+  const safe = html
+    .replace(/<tg-slideshow>[\s\S]*?<\/tg-slideshow>/gi, ' [📷] ')
     .replace(/<tg-emoji[^>]*>.*?<\/tg-emoji>/gi, '👍')
-    .replace(/<tg-sub[^>]*>/gi, '<small>')
-    .replace(/<\/tg-sub>/gi, '</small>')
-    .replace(/<tg-sup[^>]*>/gi, '<small>')
-    .replace(/<\/tg-sup>/gi, '</small>')
-    .replace(/<tg-marked[^>]*>/gi, '<b>')
-    .replace(/<\/tg-marked>/gi, '</b>')
+    .replace(/<tg-sub[^>]*>/gi, '').replace(/<\/tg-sub>/gi, '')
+    .replace(/<tg-sup[^>]*>/gi, '').replace(/<\/tg-sup>/gi, '')
+    .replace(/<tg-marked[^>]*>/gi, '<b>').replace(/<\/tg-marked>/gi, '</b>')
     .replace(/<tg-math[^>]*>([\s\S]*?)<\/tg-math>/gi, '$1')
-    .replace(/<tg-map[^>]*\/>/gi, '[📍 карта]')
+    .replace(/<tg-map[^>]*\/>/gi, ' [📍] ')
     .replace(/<details[\s\S]*?<\/details>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
+    .replace(/<\/?aside[^>]*>/gi, '')
+    .replace(/ class="[^"]*"/gi, '')
+    .replace(/ contenteditable="[^"]*"/gi, '')
+    .replace(/<h([1-3])>/gi, '<b>').replace(/<\/h([1-3])>/gi, '</b>')
+    .replace(/<pre>/gi, '<pre>').replace(/<\/pre>/gi, '</pre>')
+    .replace(/<code>/gi, '<code>').replace(/<\/code>/gi, '</code>')
     .trim()
-  if (!strip) return { ok: false, error: 'empty after fallback' }
-  const sent = await bot.telegram.sendMessage(chatId, strip.slice(0, 4096), { parse_mode: 'HTML' })
-  return { ok: true, message_id: sent.message_id }
+  if (!safe) return { ok: false, error: 'empty after fallback' }
+  try {
+    const sent = await bot.telegram.sendMessage(chatId, safe.slice(0, 4096), { parse_mode: 'HTML' })
+    return { ok: true, message_id: sent.message_id }
+  } catch (_) {
+    const plain = safe.replace(/<[^>]+>/g, '').trim()
+    if (!plain) return { ok: false, error: 'empty' }
+    const sent = await bot.telegram.sendMessage(chatId, plain.slice(0, 4096))
+    return { ok: true, message_id: sent.message_id, plain: true }
+  }
 }
 
 async function handler(req, res) {
