@@ -63,19 +63,24 @@ function json(res, data, s = 200) {
   res.end(JSON.stringify(data))
 }
 
-async function uploadImageToTg(buffer, mime, chatId) {
+async function uploadImageToTg(buffer, mime, uploadChatId) {
   try {
     const fd = new FormData()
-    fd.append('chat_id', String(chatId || OWNER || (await bot.telegram.getMe()).id))
+    fd.append('chat_id', String(uploadChatId))
     fd.append('photo', buffer, { filename: 'photo.' + (mime && mime.includes('png') ? 'png' : 'jpg'), contentType: mime || 'image/jpeg' })
     const r = await fetch('https://api.telegram.org/bot' + TOKEN + '/sendPhoto', { method: 'POST', body: fd, headers: fd.getHeaders() })
     const d = await r.json()
     if (!d.ok) return null
-    const fileId = d.result.photo[d.result.photo.length - 1].file_id
-    const fr = await fetch('https://api.telegram.org/bot' + TOKEN + '/getFile?file_id=' + fileId)
-    const f = await fr.json()
-    if (!f.ok) return null
-    return 'https://api.telegram.org/file/bot' + TOKEN + '/' + f.result.file_path
+    return d.result.photo[d.result.photo.length - 1].file_id
+  } catch (e) { return null }
+}
+
+async function getFileUrl(fileId) {
+  try {
+    const r = await fetch('https://api.telegram.org/bot' + TOKEN + '/getFile?file_id=' + fileId)
+    const d = await r.json()
+    if (!d.ok) return null
+    return 'https://api.telegram.org/file/bot' + TOKEN + '/' + d.result.file_path
   } catch (e) { return null }
 }
 
@@ -192,12 +197,25 @@ async function handler(req, res) {
       }
 
       if (imageKeys.length > 0) {
+        const uploadChat = Number(OWNER) || chatId
         for (const key of imageKeys) {
           const file = files[key]
           if (file && file.buffer && file.buffer.length > 0) {
-            const url = await uploadImageToTg(file.buffer, file.mime, chatId)
-            if (url) richHtml = richHtml.replace('attach://' + key, url)
+            try {
+              await bot.telegram.sendPhoto(chatId, { source: file.buffer, filename: file.filename || 'photo.jpg' })
+            } catch (e) { console.warn('sendPhoto:', e.message) }
+            try {
+              const fileId = await uploadImageToTg(file.buffer, file.mime, uploadChat)
+              if (fileId) {
+                const url = await getFileUrl(fileId)
+                if (url) richHtml = richHtml.replace('attach://' + key, url)
+              }
+            } catch (e) { /* best-effort */ }
           }
+        }
+        if (richHtml.includes('attach://')) {
+          richHtml = richHtml.replace(/<tg-slideshow[\s\S]*?<\/tg-slideshow>/gi, '[📷]')
+          richHtml = richHtml.replace(/\s*src="attach:\/\/[^"]*"/gi, '')
         }
       }
 
