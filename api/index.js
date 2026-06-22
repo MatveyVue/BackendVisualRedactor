@@ -3,29 +3,31 @@ const FormData = require('form-data/lib/form_data')
 
 const TOKEN = process.env.BOT_TOKEN || ''
 const BASE = process.env.URL || process.env.VERCEL_URL || ''
+const OWNER = process.env.OWNER_ID || ''
 
 let kv
 try { kv = require('@vercel/kv').kv } catch (e) { kv = null }
 const mem = {}
 
-function getCh(uid) {
-  return Promise.resolve(mem[uid] || [])
-}
+function getCh(uid) { return Promise.resolve(mem[uid] || []) }
 function setCh(uid, list) {
   mem[uid] = list
   if (kv) kv.set('ch:' + uid, list).catch(() => {})
 }
 
 let bot
-function initBot() {
-  if (!TOKEN || bot) return
+let botReady = false
+const botPromise = (async () => {
+  if (!TOKEN) return
   bot = new Telegraf(TOKEN)
+  try {
+    await bot.telegram.getMe()
+    botReady = true
+  } catch (e) { console.error('bot init fail:', e.message) }
   if (BASE && !BASE.includes('localhost')) {
     bot.telegram.setWebhook(BASE.replace(/\/+$/, '') + '/api/webhook').catch(() => {})
   }
-  bot.telegram.getMe().catch(() => {})
-}
-initBot()
+})()
 
 function parseBody(req) {
   return new Promise(r => {
@@ -63,10 +65,10 @@ function json(res, data, s = 200) {
   res.end(JSON.stringify(data))
 }
 
-async function uploadImageToTg(buffer, mime) {
+async function uploadImageToTg(buffer, mime, chatId) {
   try {
     const fd = new FormData()
-    fd.append('chat_id', String(process.env.OWNER_ID || '0'))
+    fd.append('chat_id', String(chatId || OWNER || (await bot.telegram.getMe()).id))
     fd.append('photo', buffer, { filename: 'photo.' + (mime && mime.includes('png') ? 'png' : 'jpg'), contentType: mime || 'image/jpeg' })
     const r = await fetch('https://api.telegram.org/bot' + TOKEN + '/sendPhoto', { method: 'POST', body: fd, headers: fd.getHeaders() })
     const d = await r.json()
@@ -77,6 +79,28 @@ async function uploadImageToTg(buffer, mime) {
     if (!f.ok) return null
     return 'https://api.telegram.org/file/bot' + TOKEN + '/' + f.result.file_path
   } catch (e) { return null }
+}
+
+async function sendFallback(chatId, html) {
+  const strip = html.replace(/<tg-spoiler[^>]*>/gi, '<span class="tg-spoiler">')
+    .replace(/<\/tg-spoiler>/gi, '</span>')
+    .replace(/<tg-slideshow>[\s\S]*?<\/tg-slideshow>/gi, '[📷 слайдшоу]')
+    .replace(/<tg-emoji[^>]*>.*?<\/tg-emoji>/gi, '👍')
+    .replace(/<tg-sub[^>]*>/gi, '<small>')
+    .replace(/<\/tg-sub>/gi, '</small>')
+    .replace(/<tg-sup[^>]*>/gi, '<small>')
+    .replace(/<\/tg-sup>/gi, '</small>')
+    .replace(/<tg-marked[^>]*>/gi, '<b>')
+    .replace(/<\/tg-marked>/gi, '</b>')
+    .replace(/<tg-math[^>]*>([\s\S]*?)<\/tg-math>/gi, '$1')
+    .replace(/<tg-map[^>]*\/>/gi, '[📍 карта]')
+    .replace(/<details[\s\S]*?<\/details>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .trim()
+  if (!strip) return { ok: false, error: 'empty after fallback' }
+  const sent = await bot.telegram.sendMessage(chatId, strip.slice(0, 4096), { parse_mode: 'HTML' })
+  return { ok: true, message_id: sent.message_id }
 }
 
 async function handler(req, res) {
@@ -141,23 +165,23 @@ async function handler(req, res) {
       const { fields, files } = body
       const { userId, destination, html, text, channelId } = fields
       if (!userId || !destination || !text) return json(res, { ok: false, error: 'Missing fields' }, 400)
-      if (!bot) return json(res, { ok: false, error: 'Bot not ready' }, 503)
+      await botPromise
+      if (!bot || !botReady) return json(res, { ok: false, error: 'Bot not ready' }, 503)
 
       const { toRichHtml } = require('../lib/rich')
       let richHtml = toRichHtml(html || text)
-
       const imageKeys = Object.keys(files).filter(k => k.startsWith('img_')).sort()
-      let chatId
+      let chatId, chInfo
       if (destination === 'channel') {
         const list = await getCh(userId)
         if (!list.length) return json(res, { ok: false, error: 'no_channels' })
         const chId = channelId ? Number(channelId) : null
-        const ch = chId ? list.find(c => c.id === chId) : list[0]
-        if (!ch) return json(res, { ok: false, error: 'channel_not_found' }, 400)
-        chatId = ch.id
+        chInfo = chId ? list.find(c => c.id === chId) : list[0]
+        if (!chInfo) return json(res, { ok: false, error: 'channel_not_found' }, 400)
+        chatId = chInfo.id
       } else {
         const uid = Number(userId)
-        chatId = uid > 0 ? uid : Number(process.env.OWNER_ID) || 0
+        chatId = uid > 0 ? uid : Number(OWNER) || 0
         if (!chatId) return json(res, { ok: false, error: 'no_user_id' }, 400)
       }
 
@@ -165,34 +189,25 @@ async function handler(req, res) {
         for (const key of imageKeys) {
           const file = files[key]
           if (file && file.buffer && file.buffer.length > 0) {
-            const url = await uploadImageToTg(file.buffer, file.mime)
+            const url = await uploadImageToTg(file.buffer, file.mime, chatId)
             if (url) richHtml = richHtml.replace('attach://' + key, url)
           }
         }
       }
 
       try {
-        const richMessage = { html: richHtml }
+        const sent = await bot.telegram.callApi('sendRichMessage', { chat_id: chatId, rich_message: { html: richHtml } })
         if (destination === 'channel') {
-          const list = await getCh(userId)
-          if (!list.length) return json(res, { ok: false, error: 'no_channels' })
-          const chId = channelId ? Number(channelId) : null
-          const ch = chId ? list.find(c => c.id === chId) : list[0]
-          if (!ch) return json(res, { ok: false, error: 'channel_not_found' }, 400)
-          const sent = await bot.telegram.callApi('sendRichMessage', { chat_id: ch.id, rich_message: richMessage })
-          const link = ch.username ? 'https://t.me/' + ch.username.replace('@', '') + '/' + sent.message_id : null
-          return json(res, { ok: true, channel: ch.title, link })
+          const link = chInfo?.username ? 'https://t.me/' + chInfo.username.replace('@', '') + '/' + sent.message_id : null
+          return json(res, { ok: true, channel: chInfo?.title, link })
         }
-        if (destination === 'saved') {
-          const uid = Number(userId)
-          const targetId = uid > 0 ? uid : Number(process.env.OWNER_ID) || 0
-          if (!targetId) return json(res, { ok: false, error: 'no_user_id' }, 400)
-          await bot.telegram.callApi('sendRichMessage', { chat_id: targetId, rich_message: richMessage })
-          return json(res, { ok: true })
-        }
-        return json(res, { ok: false, error: 'unknown_destination' }, 400)
+        return json(res, { ok: true })
       } catch (e) {
-        return json(res, { ok: false, error: e.message }, 500)
+        try {
+          const fallback = await sendFallback(chatId, richHtml)
+          if (fallback.ok) return json(res, { ok: true, fallback: true, msg: 'Без rich-форматирования' })
+        } catch (_) {}
+        return json(res, { ok: false, error: e.message + (e.description ? ' — ' + e.description : '') }, 500)
       }
     }
 
