@@ -89,13 +89,14 @@ async function getFileUrl(fileId) {
 
 async function sendFallback(chatId, html) {
   const safe = html
-    .replace(/<tg-slideshow>[\s\S]*?<\/tg-slideshow>/gi, ' [📷] ')
+    .replace(/<tg-slideshow[\s\S]*?<\/tg-slideshow>/gi, '')
+    .replace(/ src="attach:\/\/[^"]*"/gi, '')
     .replace(/<tg-emoji[^>]*>.*?<\/tg-emoji>/gi, '👍')
     .replace(/<tg-sub[^>]*>/gi, '').replace(/<\/tg-sub>/gi, '')
     .replace(/<tg-sup[^>]*>/gi, '').replace(/<\/tg-sup>/gi, '')
     .replace(/<tg-marked[^>]*>/gi, '<b>').replace(/<\/tg-marked>/gi, '</b>')
     .replace(/<tg-math[^>]*>([\s\S]*?)<\/tg-math>/gi, '$1')
-    .replace(/<tg-map[^>]*\/>/gi, ' [📍] ')
+    .replace(/<tg-map[^>]*\/>/gi, '')
     .replace(/<details[\s\S]*?<\/details>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/?aside[^>]*>/gi, '')
@@ -185,42 +186,47 @@ app.post('/api/publish', async (req, res) => {
     if (!chatId) return res.status(400).json({ ok: false, error: 'no_user_id' })
   }
 
-  if (imageKeys.length > 0) {
-    const uploadChat = Number(OWNER) || chatId
-    for (const key of imageKeys) {
-      const file = files[key]
-      if (file && file.buffer && file.buffer.length > 0) {
-        try {
-          await bot.telegram.sendPhoto(chatId, { source: file.buffer, filename: file.filename || 'photo.jpg' })
-        } catch (e) { console.warn('sendPhoto:', e.message) }
-        try {
-          const fileId = await uploadImageToTg(file.buffer, file.mime, uploadChat)
-          if (fileId) {
-            const url = await getFileUrl(fileId)
-            if (url) richHtml = richHtml.replace('attach://' + key, url)
-          }
-        } catch (e) { /* best-effort */ }
+  async function sendIt(html) {
+    const clean = html.replace(/ src="attach:\/\/[^"]*"/gi, '').replace(/<tg-slideshow[\s\S]*?<\/tg-slideshow>/gi, '')
+    try {
+      const sent = await bot.telegram.callApi('sendRichMessage', { chat_id: chatId, rich_message: { html: clean } })
+      if (destination === 'channel') {
+        const link = chInfo?.username ? 'https://t.me/' + chInfo.username.replace('@', '') + '/' + sent.message_id : null
+        return res.json({ ok: true, channel: chInfo?.title, link })
       }
-    }
-    if (richHtml.includes('attach://')) {
-      richHtml = richHtml.replace(/<tg-slideshow[\s\S]*?<\/tg-slideshow>/gi, '[📷]')
-      richHtml = richHtml.replace(/\s*src="attach:\/\/[^"]*"/gi, '')
+      res.json({ ok: true })
+    } catch (e) {
+      try {
+        const fallback = await sendFallback(chatId, clean)
+        if (fallback.ok) return res.json({ ok: true, fallback: true, msg: 'Без rich-форматирования' })
+      } catch (_) {}
+      res.status(500).json({ ok: false, error: e.message + (e.description ? ' — ' + e.description : '') })
     }
   }
 
-  try {
-    const sent = await bot.telegram.callApi('sendRichMessage', { chat_id: chatId, rich_message: { html: richHtml } })
-    if (destination === 'channel') {
-      const link = chInfo?.username ? 'https://t.me/' + chInfo.username.replace('@', '') + '/' + sent.message_id : null
-      return res.json({ ok: true, channel: chInfo?.title, link })
+  if (imageKeys.length > 0) {
+    const payload = {
+      chat_id: chatId,
+      rich_message: { html: richHtml, files: imageKeys.map((k) => ({ file: 'attach://' + k })) }
     }
-    res.json({ ok: true })
-  } catch (e) {
+    for (const key of imageKeys) {
+      const file = files[key]
+      if (file && file.buffer && file.buffer.length > 0) {
+        payload[key] = { source: file.buffer, filename: file.filename || (key + '.jpg') }
+      }
+    }
     try {
-      const fallback = await sendFallback(chatId, richHtml)
-      if (fallback.ok) return res.json({ ok: true, fallback: true, msg: 'Без rich-форматирования' })
-    } catch (_) {}
-    res.status(500).json({ ok: false, error: e.message + (e.description ? ' — ' + e.description : '') })
+      const sent = await bot.telegram.callApi('sendRichMessage', payload)
+      if (destination === 'channel') {
+        const link = chInfo?.username ? 'https://t.me/' + chInfo.username.replace('@', '') + '/' + sent.message_id : null
+        return res.json({ ok: true, channel: chInfo?.title, link })
+      }
+      res.json({ ok: true })
+    } catch (e) {
+      await sendIt(richHtml)
+    }
+  } else {
+    await sendIt(richHtml)
   }
 })
 
