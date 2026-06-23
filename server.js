@@ -1,9 +1,9 @@
 const express = require('express')
 const { Telegraf } = require('telegraf')
-const FormData = require('form-data/lib/form_data')
+
 const busboy = require('busboy')
 const path = require('path')
-const { toRichHtml } = require('./lib/rich')
+const { toRichHtml, toStandardHtml } = require('./lib/rich')
 const FRONTEND_DIR = path.join(__dirname, '..', 'frontend')
 
 const app = express()
@@ -63,28 +63,6 @@ function parseMultipart(req) {
     bb.on('error', () => resolve({ fields, files }))
     req.pipe(bb)
   })
-}
-
-/* === Upload image to Telegram === */
-async function uploadImageToTg(buffer, mime, uploadChatId) {
-  try {
-    const fd = new FormData()
-    fd.append('chat_id', String(uploadChatId))
-    fd.append('photo', buffer, { filename: 'photo.' + (mime && mime.includes('png') ? 'png' : 'jpg'), contentType: mime || 'image/jpeg' })
-    const r = await fetch('https://api.telegram.org/bot' + TOKEN + '/sendPhoto', { method: 'POST', body: fd, headers: fd.getHeaders() })
-    const d = await r.json()
-    if (!d.ok) return null
-    return d.result.photo[d.result.photo.length - 1].file_id
-  } catch (e) { return null }
-}
-
-async function getFileUrl(fileId) {
-  try {
-    const r = await fetch('https://api.telegram.org/bot' + TOKEN + '/getFile?file_id=' + fileId)
-    const d = await r.json()
-    if (!d.ok) return null
-    return 'https://api.telegram.org/file/bot' + TOKEN + '/' + d.result.file_path
-  } catch (e) { return null }
 }
 
 async function sendFallback(chatId, html) {
@@ -169,7 +147,7 @@ app.post('/api/publish', async (req, res) => {
   await botPromise
   if (!bot || !botReady) return res.status(503).json({ ok: false, error: 'Bot not ready' })
 
-  let richHtml = toRichHtml(html || text)
+  const richHtml = toRichHtml(html || text)
   const imageKeys = Object.keys(files).filter((k) => k.startsWith('img_')).sort()
   let chatId, chInfo
 
@@ -186,47 +164,85 @@ app.post('/api/publish', async (req, res) => {
     if (!chatId) return res.status(400).json({ ok: false, error: 'no_user_id' })
   }
 
-  async function sendIt(html) {
-    const clean = html.replace(/ src="attach:\/\/[^"]*"/gi, '').replace(/<tg-slideshow[\s\S]*?<\/tg-slideshow>/gi, '')
-    try {
-      const sent = await bot.telegram.callApi('sendRichMessage', { chat_id: chatId, rich_message: { html: clean } })
-      if (destination === 'channel') {
-        const link = chInfo?.username ? 'https://t.me/' + chInfo.username.replace('@', '') + '/' + sent.message_id : null
-        return res.json({ ok: true, channel: chInfo?.title, link })
-      }
-      res.json({ ok: true })
-    } catch (e) {
-      try {
-        const fallback = await sendFallback(chatId, clean)
-        if (fallback.ok) return res.json({ ok: true, fallback: true, msg: 'Без rich-форматирования' })
-      } catch (_) {}
-      res.status(500).json({ ok: false, error: e.message + (e.description ? ' — ' + e.description : '') })
-    }
+  function link(msgId) {
+    if (destination !== 'channel' || !chInfo?.username) return null
+    return 'https://t.me/' + chInfo.username.replace('@', '') + '/' + msgId
+  }
+  function ok(msgId) {
+    return res.json({ ok: true, message_id: msgId, channel: chInfo?.title, link: link(msgId) })
   }
 
-  if (imageKeys.length > 0) {
-    const payload = {
-      chat_id: chatId,
-      rich_message: { html: richHtml, files: imageKeys.map((k) => ({ file: 'attach://' + k })) }
-    }
-    for (const key of imageKeys) {
-      const file = files[key]
-      if (file && file.buffer && file.buffer.length > 0) {
-        payload[key] = { source: file.buffer, filename: file.filename || (key + '.jpg') }
+  /* Try sendRichMessage (Bot API 10.1+) — supports all rich formatting */
+  async function tryRich(html, fileMap) {
+    const payload = { chat_id: chatId, rich_message: { html } }
+    if (fileMap) {
+      payload.rich_message.files = fileMap.map((k) => ({ file: 'attach://' + k }))
+      for (const key of fileMap) {
+        const f = files[key]
+        if (f && f.buffer && f.buffer.length > 0) payload[key] = { source: f.buffer, filename: f.filename || (key + '.jpg') }
       }
     }
-    try {
-      const sent = await bot.telegram.callApi('sendRichMessage', payload)
-      if (destination === 'channel') {
-        const link = chInfo?.username ? 'https://t.me/' + chInfo.username.replace('@', '') + '/' + sent.message_id : null
-        return res.json({ ok: true, channel: chInfo?.title, link })
-      }
-      res.json({ ok: true })
-    } catch (e) {
-      await sendIt(richHtml)
+    const sent = await bot.telegram.callApi('sendRichMessage', payload)
+    return sent.message_id
+  }
+
+  /* Standard API: sendPhoto / sendMediaGroup / sendMessage with parse_mode: 'HTML' */
+  async function tryStandard(html, photoKeys) {
+    const stdHtml = toStandardHtml(html)
+    const fileList = photoKeys.map((k) => files[k]).filter((f) => f && f.buffer && f.buffer.length > 0)
+    const makeInput = (f) => ({ source: f.buffer, filename: f.filename || 'photo.jpg' })
+
+    if (fileList.length === 1) {
+      const sent = await bot.telegram.sendPhoto(chatId, makeInput(fileList[0]), {
+        caption: stdHtml.slice(0, 1024), parse_mode: 'HTML'
+      })
+      return sent.message_id
     }
-  } else {
-    await sendIt(richHtml)
+    if (fileList.length > 1) {
+      const media = fileList.map((f, i) => ({
+        type: 'photo', media: makeInput(f),
+        ...(i === fileList.length - 1 ? { caption: stdHtml.slice(0, 1024), parse_mode: 'HTML' } : {})
+      }))
+      const sent = await bot.telegram.sendMediaGroup(chatId, media)
+      return sent[sent.length - 1].message_id
+    }
+    const sent = await bot.telegram.sendMessage(chatId, stdHtml.slice(0, 4096), { parse_mode: 'HTML' })
+    return sent.message_id
+  }
+
+  try {
+    if (imageKeys.length > 0) {
+      try {
+        const id = await tryRich(richHtml, imageKeys)
+        return ok(id)
+      } catch (_) {
+        /* Rich API not available — try standard */
+        try {
+          const id = await tryStandard(richHtml, imageKeys)
+          return ok(id)
+        } catch (_2) {
+          const fallback = await sendFallback(chatId, richHtml)
+          if (fallback.ok) return ok(fallback.message_id)
+          throw new Error('All send methods failed')
+        }
+      }
+    } else {
+      try {
+        const id = await tryRich(richHtml, null)
+        return ok(id)
+      } catch (_) {
+        try {
+          const id = await tryStandard(richHtml, [])
+          return ok(id)
+        } catch (_2) {
+          const fallback = await sendFallback(chatId, richHtml)
+          if (fallback.ok) return ok(fallback.message_id)
+          throw new Error('All send methods failed')
+        }
+      }
+    }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
   }
 })
 
