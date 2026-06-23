@@ -136,7 +136,7 @@ app.post('/api/channels/add', async (req, res) => {
     const clean = username.replace('@', '').trim()
     const chat = await bot.telegram.getChat('@' + clean)
     if (chat.type !== 'channel') return res.status(400).json({ ok: false, error: 'Не канал' })
-    const me = botInfo || await bot.telegram.getMe()
+    const me = bot.botInfo || await bot.telegram.getMe()
     const member = await bot.telegram.getChatMember(chat.id, me.id)
     if (!member || !['administrator', 'creator'].includes(member.status)) return res.status(400).json({ ok: false, error: 'Бот не админ' })
     const list = await getCh(userId)
