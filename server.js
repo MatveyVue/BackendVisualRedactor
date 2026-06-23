@@ -134,6 +134,23 @@ app.post('/api/channels/remove', async (req, res) => {
   res.json({ ok: true })
 })
 
+app.post('/api/emoji', async (req, res) => {
+  const { ids } = req.body
+  if (!ids || !Array.isArray(ids) || !ids.length) return res.status(400).json({ ok: false, error: 'Missing ids' })
+  await botPromise
+  if (!bot || !botReady) return res.status(503).json({ ok: false, error: 'Bot not ready' })
+  try {
+    const stickers = await bot.telegram.callApi('getCustomEmojiStickers', { custom_emoji_ids: ids })
+    const emojis = await Promise.all(stickers.map(async (s) => {
+      const file = await bot.telegram.getFile(s.file_id)
+      return { id: s.custom_emoji_id, url: 'https://api.telegram.org/file/bot' + TOKEN + '/' + file.file_path }
+    }))
+    res.json({ ok: true, emojis })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
 app.post('/api/publish', async (req, res) => {
   const ct = req.headers['content-type'] || ''
   let fields, files
@@ -230,13 +247,14 @@ app.post('/api/publish', async (req, res) => {
 
   try {
     if (imageKeys.length > 0) {
+      /* Photos: Standard API (sendPhoto/sendMediaGroup) is most reliable */
       try {
-        const id = await tryRich(richHtml, imageKeys)
+        const id = await tryStandard(richHtml, imageKeys)
         return ok(id)
       } catch (_) {
-        /* Rich API not available — try standard */
+        /* Fall back to sendRichMessage (supports inline images + rich formatting) */
         try {
-          const id = await tryStandard(richHtml, imageKeys)
+          const id = await tryRich(richHtml, imageKeys)
           return ok(id)
         } catch (_2) {
           const fallback = await sendFallback(chatId, richHtml)
@@ -260,6 +278,7 @@ app.post('/api/publish', async (req, res) => {
       }
     }
   } catch (e) {
+    console.error('publish error:', e)
     res.status(500).json({ ok: false, error: e.message })
   }
 })

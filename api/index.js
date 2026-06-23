@@ -150,6 +150,24 @@ async function handler(req, res) {
       return json(res, { ok: true })
     }
 
+    if (req.method === 'POST' && path === '/api/emoji') {
+      const { fields } = await parseBody(req)
+      const { ids } = fields
+      if (!ids || !Array.isArray(ids) || !ids.length) return json(res, { ok: false, error: 'Missing ids' }, 400)
+      await botPromise
+      if (!bot || !botReady) return json(res, { ok: false, error: 'Bot not ready' }, 503)
+      try {
+        const stickers = await bot.telegram.callApi('getCustomEmojiStickers', { custom_emoji_ids: ids })
+        const emojis = await Promise.all(stickers.map(async (s) => {
+          const file = await bot.telegram.getFile(s.file_id)
+          return { id: s.custom_emoji_id, url: 'https://api.telegram.org/file/bot' + TOKEN + '/' + file.file_path }
+        }))
+        return json(res, { ok: true, emojis })
+      } catch (e) {
+        return json(res, { ok: false, error: e.message }, 500)
+      }
+    }
+
     if (req.method === 'POST' && path === '/api/publish') {
       const body = await parseBody(req)
       const { fields, files } = body
@@ -240,12 +258,13 @@ async function handler(req, res) {
 
       try {
         if (imageKeys.length > 0) {
+          /* Photos: Standard API first (proven reliable) */
           try {
-            const id = await tryRich(richHtml, imageKeys)
+            const id = await tryStandard(richHtml, imageKeys)
             return ok(id)
           } catch (_) {
             try {
-              const id = await tryStandard(richHtml, imageKeys)
+              const id = await tryRich(richHtml, imageKeys)
               return ok(id)
             } catch (_2) {
               const fb = await sendFallback(chatId, richHtml)
