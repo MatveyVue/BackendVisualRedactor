@@ -65,6 +65,7 @@ async function sendFallback(chatId, html) {
   const safe = html
     .replace(/<tg-slideshow[\s\S]*?<\/tg-slideshow>/gi, '')
     .replace(/ src="attach:\/\/[^"]*"/gi, '')
+    .replace(/<img[^>]*>/gi, '')
     .replace(/<tg-emoji[^>]*>.*?<\/tg-emoji>/gi, '👍')
     .replace(/<tg-sub[^>]*>/gi, '').replace(/<\/tg-sub>/gi, '')
     .replace(/<tg-sup[^>]*>/gi, '').replace(/<\/tg-sup>/gi, '')
@@ -192,7 +193,10 @@ async function handler(req, res) {
             if (f && f.buffer && f.buffer.length > 0) payload[key] = { source: f.buffer, filename: f.filename || (key + '.jpg') }
           }
         }
-        const sent = await bot.telegram.callApi('sendRichMessage', payload)
+        const sent = await Promise.race([
+          bot.telegram.callApi('sendRichMessage', payload),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000))
+        ])
         return sent.message_id
       }
 
