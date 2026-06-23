@@ -183,11 +183,25 @@ app.post('/api/publish', async (req, res) => {
         if (f && f.buffer && f.buffer.length > 0) payload[key] = { source: f.buffer, filename: f.filename || (key + '.jpg') }
       }
     }
-    const sent = await Promise.race([
-      bot.telegram.callApi('sendRichMessage', payload),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000))
-    ])
-    return sent.message_id
+    try {
+      const sent = await Promise.race([
+        bot.telegram.callApi('sendRichMessage', payload),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000))
+      ])
+      return sent.message_id
+    } catch (e) {
+      console.warn('tryRich:', e.description || e.message)
+      throw e
+    }
+  }
+
+  /* Safe HTML truncation — never cut inside a tag */
+  function truncHtml(s, max) {
+    if (s.length <= max) return s
+    const cut = s.slice(0, max)
+    const lo = cut.lastIndexOf('<')
+    const lc = cut.lastIndexOf('>')
+    return lo > lc ? cut.slice(0, lo) : cut
   }
 
   /* Standard API: sendPhoto / sendMediaGroup / sendMessage with parse_mode: 'HTML' */
@@ -198,19 +212,19 @@ app.post('/api/publish', async (req, res) => {
 
     if (fileList.length === 1) {
       const sent = await bot.telegram.sendPhoto(chatId, makeInput(fileList[0]), {
-        caption: stdHtml.slice(0, 1024), parse_mode: 'HTML'
+        caption: truncHtml(stdHtml, 1024), parse_mode: 'HTML'
       })
       return sent.message_id
     }
     if (fileList.length > 1) {
       const media = fileList.map((f, i) => ({
         type: 'photo', media: makeInput(f),
-        ...(i === fileList.length - 1 ? { caption: stdHtml.slice(0, 1024), parse_mode: 'HTML' } : {})
+        ...(i === fileList.length - 1 ? { caption: truncHtml(stdHtml, 1024), parse_mode: 'HTML' } : {})
       }))
       const sent = await bot.telegram.sendMediaGroup(chatId, media)
       return sent[sent.length - 1].message_id
     }
-    const sent = await bot.telegram.sendMessage(chatId, stdHtml.slice(0, 4096), { parse_mode: 'HTML' })
+    const sent = await bot.telegram.sendMessage(chatId, truncHtml(stdHtml, 4096), { parse_mode: 'HTML' })
     return sent.message_id
   }
 
